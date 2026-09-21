@@ -1,6 +1,6 @@
 {
   "name": "mnjev-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Unofficial CLI for TypeSafe's Jev decision model. Ask a typed question, get a decision with calibrated probabilities.",
   "type": "module",
   "bin": {
