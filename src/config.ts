@@ -61,3 +61,18 @@ export const MAX_RETRIES = number("JEV_RETRIES", 3, 0, 10);
 
 /** First backoff delay; each attempt doubles it. Lowered in tests to keep them fast. */
 export const RETRY_BASE_MS = number("JEV_RETRY_BASE_MS", 500, 1, 60_000);
+
+/** Price per million input tokens. Output is free, so `/cost` only counts input. */
+export const PRICE_PER_MTOK = 0.042;
+
+/**
+ * Lines landing inside this window came from one paste; typing cannot be this fast.
+ * ponytail: timing heuristic, swap for bracketed paste mode if a terminal delivers slowly.
+ */
+export const PASTE_WINDOW_MS = number("JEV_PASTE_MS", 12, 1, 500);
+
+/** Items `map` keeps in flight, and sockets held open for them. */
+export const CONCURRENCY = number("JEV_CONCURRENCY", 8, 1, 32);
+
+/** Lines kept in ~/.mnjev/history. */
+export const HISTORY_MAX = 500;

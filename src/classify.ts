@@ -1,5 +1,5 @@
 import { OPTION_CEILING } from "./config.ts";
-import { ask, buildQuestion, CONFIDENCE_FLOOR, NONE, withEscapeHatch, type Answer, type Question } from "./jev.ts";
+import { ask, buildQuestion, checkState, CONFIDENCE_FLOOR, NONE, withEscapeHatch, type Answer, type Question } from "./jev.ts";
 import { explicit, explicitQuestion, hasCriterion, maxOptions, mayHaveOptions, spans } from "./parse.ts";
 
 /** Used when Jev calls something a rating but the line names no levels of its own. */
@@ -15,7 +15,7 @@ export type Resolved =
  * because Jev returns no text and so can never hand a list back.
  * Returns null when the line names no alternatives.
  */
-export async function findOptions(line: string): Promise<string[] | null> {
+export async function findOptions(line: string, signal?: AbortSignal): Promise<string[] | null> {
   // Guard here too, not only in the caller: a sentence with no separator has no
   // alternatives, however many word runs can be sliced out of it.
   if (!mayHaveOptions(line)) return null;
@@ -48,7 +48,7 @@ export async function findOptions(line: string): Promise<string[] | null> {
       ]) as Record<string, string>,
     },
     ...Object.fromEntries(ordinals.map((o, i) => [`o${i}`, nth(o)])),
-  });
+  }, undefined, signal);
 
   const count = res.answers.count as Extract<Answer, { type: "choice" }>;
   // An unsure count means Jev could not tell whether these are alternatives at all.
@@ -88,13 +88,20 @@ const TYPE_CRITERIA = {
  * own call because its result defines the choice question. Lines that name no
  * alternatives skip it, so a plain yes/no still costs a single round trip.
  */
-export async function askAll(state: string, lines: string[]): Promise<Resolved[]> {
+export async function askAll(state: string, lines: string[], signal?: AbortSignal): Promise<Resolved[]> {
+  // Before option finding, so refused state does not first cost a call per line.
+  checkState(state);
+
   const found = await Promise.all(
     lines.map((line) =>
       explicit(line) || !mayHaveOptions(line)
         ? Promise.resolve(null)
         // Finding options is an improvement, not a requirement: a failure still answers.
-        : findOptions(line).catch(() => null),
+        // A cancel is not a failure, though, and must not be read as "no options".
+        : findOptions(line, signal).catch((err) => {
+            if (signal?.aborted) throw err;
+            return null;
+          }),
     ),
   );
 
@@ -120,7 +127,7 @@ export async function askAll(state: string, lines: string[]): Promise<Resolved[]
     return { fixed: null, forms: f, error: null };
   });
 
-  const res = await ask(state, questions);
+  const res = await ask(state, questions, undefined, signal);
 
   return lines.map((text, i): Resolved => {
     const bare = !hasCriterion(text);

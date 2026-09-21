@@ -1,11 +1,13 @@
 import { readFileSync } from "node:fs";
 import { Agent, request } from "node:https";
+import { setTimeout as sleep } from "node:timers/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { CONFIDENCE_FLOOR, ESCAPE_HATCH, MAX_RETRIES, REQUEST_TIMEOUT_MS, RETRY_BASE_MS } from "./config.ts";
+import { CONCURRENCY, CONFIDENCE_FLOOR, ESCAPE_HATCH, MAX_RETRIES, MAX_STATE, REQUEST_TIMEOUT_MS, RETRY_BASE_MS } from "./config.ts";
 
 export { CONFIDENCE_FLOOR };
-export const CONFIG = join(homedir(), ".mnjev", "config.json");
+export const DIR = join(homedir(), ".mnjev");
+export const CONFIG = join(DIR, "config.json");
 const HOST = "api.typesafe.ai";
 const PATH = "/v1/systemone";
 
@@ -14,12 +16,12 @@ const PATH = "/v1/systemone";
  * every question typed into the REPL was paying for a new one. Keeping the socket open
  * turns a ~1200ms request into ~290ms.
  */
-const agent = new Agent({ keepAlive: true, keepAliveMsecs: 10_000, maxSockets: 4 });
+const agent = new Agent({ keepAlive: true, keepAliveMsecs: 10_000, maxSockets: CONCURRENCY });
 
 export type Reply = { status: number; text: string; retryAfter: string | null };
-export type Transport = (payload: string, key: string) => Promise<Reply>;
+export type Transport = (payload: string, key: string, signal?: AbortSignal) => Promise<Reply>;
 
-const post: Transport = (payload, key) =>
+const post: Transport = (payload, key, signal) =>
   new Promise((resolve, reject) => {
     const req = request(
       {
@@ -27,6 +29,7 @@ const post: Transport = (payload, key) =>
         path: PATH,
         method: "POST",
         agent,
+        signal,
         headers: {
           authorization: `Bearer ${key}`,
           "content-type": "application/json",
@@ -65,6 +68,10 @@ export type Answer =
 
 export class JevError extends Error {}
 
+/** Counted per answered round trip, retries and error responses included: those bill. */
+const spent = { input_tokens: 0, output_tokens: 0, calls: 0 };
+export const usage = () => ({ ...spent });
+
 export function loadKey(): string {
   const env = process.env.TYPESAFE_API_KEY?.trim();
   if (env) return env;
@@ -81,10 +88,15 @@ export function loadKey(): string {
   return key.trim();
 }
 
+/** Accuracy falls off as state grows, so oversized state is refused rather than sent. */
+export function checkState(state: string): void {
+  if (state.length > MAX_STATE) {
+    throw new JevError(`State is ${state.length} chars. Jev loses accuracy past ~${MAX_STATE}, so send less of it.`);
+  }
+}
+
 /** Transient by nature: rate limits, overload, and gateway hiccups. */
 const RETRYABLE = new Set([429, 500, 502, 503, 504, 529]);
-
-const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
 /** Doubling backoff with jitter, unless the server named its own delay. */
 function backoffMs(attempt: number, retryAfter: string | null): number {
@@ -100,26 +112,37 @@ export async function ask(
   questions: Record<string, Question>,
   /** Swapped in tests; production always uses the keep-alive transport above. */
   transport: Transport = post,
+  signal?: AbortSignal,
 ) {
+  checkState(state);
   // Resolved before the loop, so a missing key is not reported as a network failure.
   const key = loadKey();
   const payload = JSON.stringify({ model: "jev-latest", state, questions });
 
   let res!: Reply;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      res = await transport(payload, key);
-    } catch (err) {
-      // A timeout is not retried: waiting longer for something already slow rarely helps.
-      if ((err as Error).name === "TimeoutError") {
-        throw new JevError(`mnjev did not respond within ${REQUEST_TIMEOUT_MS / 1000}s.`);
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await transport(payload, key, signal);
+        spent.calls++;
+      } catch (err) {
+        // Asked for, so never retried. Converted once, below.
+        if ((err as Error).name === "AbortError") throw err;
+        // A timeout is not retried: waiting longer for something already slow rarely helps.
+        if ((err as Error).name === "TimeoutError") {
+          throw new JevError(`mnjev did not respond within ${REQUEST_TIMEOUT_MS / 1000}s.`);
+        }
+        if (attempt >= MAX_RETRIES) throw new JevError(`Could not reach mnjev: ${(err as Error).message}`);
+        // Abortable: a Retry-After can be 60s, and ctrl-c must not look dead that long.
+        await sleep(backoffMs(attempt, null), undefined, { signal });
+        continue;
       }
-      if (attempt >= MAX_RETRIES) throw new JevError(`Could not reach mnjev: ${(err as Error).message}`);
-      await sleep(backoffMs(attempt, null));
-      continue;
+      if (!RETRYABLE.has(res.status) || attempt >= MAX_RETRIES) break;
+      await sleep(backoffMs(attempt, res.retryAfter), undefined, { signal });
     }
-    if (!RETRYABLE.has(res.status) || attempt >= MAX_RETRIES) break;
-    await sleep(backoffMs(attempt, res.retryAfter));
+  } catch (err) {
+    if ((err as Error).name === "AbortError") throw new JevError("Cancelled.");
+    throw err;
   }
 
   // An error page is not JSON, and parsing it first would hide the status.
@@ -139,9 +162,13 @@ export async function ask(
   if (missing.length) throw new JevError(`mnjev answered ${asked.length - missing.length} of ${asked.length} questions.`);
   for (const id of asked) validate(id, answers[id]);
 
+  const used = body.usage ?? { input_tokens: 0, output_tokens: 0 };
+  spent.input_tokens += used.input_tokens ?? 0;
+  spent.output_tokens += used.output_tokens ?? 0;
+
   // `model` is passed through: it names the exact version that answered, which --json
   // consumers rely on and which matters when `jev-latest` moves.
-  return { model: body.model ?? "unknown", answers, usage: body.usage ?? { input_tokens: 0, output_tokens: 0 } };
+  return { model: body.model ?? "unknown", answers, usage: used };
 }
 
 const inRange = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 1;
@@ -214,13 +241,33 @@ export function certainty(a: Answer): number {
   return a.type === "noul" ? Math.abs(a.noul - 0.5) * 2 : a.confidence;
 }
 
+/** The answer alone, with no label. One column in `map`, one word in `render`. */
+export function verdictText(a: Answer): string {
+  if (a.type === "noul") return a.noul > 0.5 ? "yes" : "no";
+  if (a.type === "choice") return a.choice;
+  return levelName(a);
+}
+
+/**
+ * Exit status for --exit-code, so a script can act on the confidence instead of
+ * parsing it. 1 is left alone: it still means the command itself failed.
+ */
+export function verdictCode(a: Answer): number {
+  if (certainty(a) < CONFIDENCE_FLOOR) return 3;
+  // A confident "none of these fit" is not an answer to act on. Exiting 0 sent
+  // `if mnjev choice ...` down the branch for an option Jev said did not apply.
+  if (a.type === "choice" && a.choice === NONE) return 3;
+  return a.type === "noul" && a.noul <= 0.5 ? 2 : 0;
+}
+
 function flag(confidence: number): string {
   return confidence < CONFIDENCE_FLOOR ? "  <- low, check this" : "";
 }
 
 /** One plain line, for piped output. The terminal gets `renderRich` instead. */
 export function render(id: string, a: Answer): string {
-  if (a.type === "noul") return `${id}: ${a.noul > 0.5 ? "yes" : "no"} (${a.noul.toFixed(2)})${flag(certainty(a))}`;
-  if (a.type === "choice") return `${id}: ${a.choice}  confidence ${a.confidence.toFixed(2)}${flag(a.confidence)}`;
-  return `${id}: ${levelName(a)} (${a.score.toFixed(2)})  confidence ${a.confidence.toFixed(2)}${flag(a.confidence)}`;
+  const v = verdictText(a);
+  if (a.type === "noul") return `${id}: ${v} (${a.noul.toFixed(2)})${flag(certainty(a))}`;
+  if (a.type === "choice") return `${id}: ${v}  confidence ${a.confidence.toFixed(2)}${flag(a.confidence)}`;
+  return `${id}: ${v} (${a.score.toFixed(2)})  confidence ${a.confidence.toFixed(2)}${flag(a.confidence)}`;
 }

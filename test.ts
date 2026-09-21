@@ -341,4 +341,194 @@ assert.ok(wordySpans.length <= 150);
   delete process.env.TYPESAFE_API_KEY;
 }
 
+
+// --- oversized state is refused at the one place every request passes through ---
+process.env.TYPESAFE_API_KEY = "test-key-for-transport-checks";
+import { checkState } from "./src/jev.ts";
+import { MAX_STATE } from "./src/config.ts";
+const huger = "x".repeat(MAX_STATE + 1);
+assert.throws(() => checkState(huger), JevError);
+assert.doesNotThrow(() => checkState("x".repeat(MAX_STATE)));
+// the one-shot path used to send it anyway, because the guard lived in the REPL
+await assert.rejects(() => ask(huger, one, async () => reply(200, ok)), /Jev loses accuracy past/);
+{
+  // and askAll refuses before spending a call per line on option finding
+  const { askAll } = await import("./src/classify.ts");
+  await assert.rejects(() => askAll(huger, ["a or b"]), /loses accuracy past/);
+}
+
+// --- a cancelled request is not a failure to retry ---
+{
+  let calls = 0;
+  const transport: Transport = () => {
+    calls++;
+    return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+  };
+  await assert.rejects(() => ask("s", one, transport), /Cancelled/);
+  assert.equal(calls, 1);
+}
+
+// --- /cost counts every call, including the ones option finding adds ---
+import { usage } from "./src/jev.ts";
+{
+  const before = usage();
+  await ask("s", one, async () => reply(200, ok));
+  const after = usage();
+  assert.equal(after.calls, before.calls + 1);
+  assert.equal(after.input_tokens, before.input_tokens + 5);
+}
+delete process.env.TYPESAFE_API_KEY;
+
+// --- /cost counts round trips that were billed, not only the ones that worked ---
+process.env.TYPESAFE_API_KEY = "test-key-for-transport-checks";
+{
+  const before = usage().calls;
+  const f = flaky([429, 503]);
+  await ask("s", one, f.transport);
+  // two rejected attempts plus the one that answered were all billed
+  assert.equal(usage().calls - before, 3);
+}
+{
+  // a request that fails outright still cost its round trips
+  const before = usage().calls;
+  await assert.rejects(() => ask("s", one, flaky([429, 429, 429, 429, 429]).transport), /mnjev 429/);
+  assert.equal(usage().calls - before, 4);
+}
+delete process.env.TYPESAFE_API_KEY;
+
+// --- completion is driven by the command table, so it can never drift from it ---
+import { completer, mentioned } from "./src/repl.ts";
+assert.deepEqual(completer("/lo"), [["/load"], "/lo"]);
+assert.deepEqual(completer("/c"), [["/clear", "/cost"], "/c"]);
+// an unknown slash command offers the whole list rather than nothing
+assert.ok(completer("/zzz")[0].includes("/help"));
+// /quit is hidden, so it is dispatchable but never suggested
+assert.ok(!completer("/")[0].includes("/quit"));
+// a plain question is not a completion target
+assert.deepEqual(completer("can penguins swim?"), [[], "can penguins swim?"]);
+// paths complete after /load and after an @
+assert.ok(completer("/load test")[0].some((p) => p.startsWith("test")));
+assert.ok(completer("is @test")[0].some((p) => p.startsWith("test")));
+
+// --- @file pulls a real file in, and anything else is left alone ---
+// an address is not a mention: the @ has to start a word
+assert.deepEqual(mentioned("mail me at bob@example.com"), { blocks: [], missing: [] });
+// a path that cannot be read is reported, never silently dropped
+assert.deepEqual(mentioned("is @nope.txt broken?").missing, ["nope.txt"]);
+{
+  const pulled = mentioned("does @test.ts check retries?");
+  assert.equal(pulled.blocks.length, 1);
+  assert.equal(pulled.missing.length, 0);
+  assert.match(pulled.blocks[0], /^--- test\.ts ---\n/);
+}
+// trailing punctuation belongs to the sentence, not to the filename
+{
+  const pulled = mentioned("what about @test.ts?");
+  assert.equal(pulled.blocks.length, 1, "the ? was treated as part of the path");
+  assert.equal(pulled.missing.length, 0);
+}
+
+// --- truncate cuts by printable width and never splits a colour code ---
+import { box as uiBox, truncate } from "./src/ui.ts";
+{
+  const bare = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const painted = `\x1b[36mabcdefghij\x1b[0m`;
+  // colour costs no width, so ten printable characters still fit a width of ten
+  assert.equal(truncate(painted, 10), painted);
+  // narrower, and it is cut to fit with the ellipsis inside the width
+  for (const w of [1, 2, 5, 9]) {
+    const cut = bare(truncate(painted, w));
+    assert.ok(cut.length <= w, `width ${w} produced ${cut.length} chars`);
+    assert.ok(cut.endsWith("\u2026"), `width ${w} lost the ellipsis`);
+  }
+  assert.equal(bare(truncate(painted, 5)), "abcd\u2026");
+  // a half-written escape would swallow whatever the terminal prints next
+  assert.ok(!/\x1b(\[[0-9;]*)?$/.test(truncate(painted, 5)), "cut ends mid-escape");
+  assert.ok(truncate(painted, 5).startsWith("\x1b[36m"), "the colour code was dropped");
+  // a CJK character takes two columns, so half as many fit
+  assert.equal(truncate("\u65e5\u672c\u8a9e\u3067\u3059", 4), "\u65e5\u2026");
+  // three CJK characters fill the same six columns as six letters, so the box pads them
+  // identically. Counting them as three would leave the right border three columns in.
+  const pad = (l: string) => uiBox([l]).split("\n")[1].match(/ *\u2502$/)![0].length;
+  assert.equal(pad("\u65e5\u672c\u8a9e"), pad("abcdef"));
+  // and the box still lines up around one
+  const line = uiBox([`\x1b[36mabcdefghijklmnopqrstuvwxyz\x1b[0m`]).split("\n")[1];
+  assert.ok(!/\x1b(\[[0-9;]*)?$/.test(line), "box row ends mid-escape");
+}
+
+// --- /run must keep the failure, which is the whole point of running a broken suite ---
+import { launch } from "./src/repl.ts";
+{
+  const r = await launch(`echo "running tests"; echo "FAIL: auth.test.js line 42" >&2; exit 2`);
+  assert.equal(r.code, 2);
+  // keeping only stdout dropped the one line worth asking Jev about
+  assert.match(r.out, /running tests/);
+  assert.match(r.out, /FAIL: auth\.test\.js line 42/);
+}
+{
+  // a command that only writes to stderr is still captured
+  const r = await launch(`echo "just a warning" >&2`);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /just a warning/);
+}
+{
+  // nothing is piped in, so a command reading stdin sees EOF instead of hanging
+  const r = await launch("cat");
+  assert.equal(r.code, 0);
+  assert.equal(r.out, "");
+}
+{
+  // a missing program reports through the shell's 127 rather than throwing
+  const r = await launch("definitely-not-a-real-command-xyz");
+  assert.equal(r.code, 127);
+}
+
+// --- a retry backoff must be interruptible, not dead for up to a minute ---
+process.env.TYPESAFE_API_KEY = "test-key-for-transport-checks";
+{
+  const ac = new AbortController();
+  const slow: Transport = async () => reply(429, "{}", "60");
+  const started = Date.now();
+  setTimeout(() => ac.abort(), 100);
+  await assert.rejects(() => ask("s", one, slow, ac.signal), /Cancelled/);
+  assert.ok(Date.now() - started < 3_000, "ctrl-c waited out the whole Retry-After");
+}
+delete process.env.TYPESAFE_API_KEY;
+
+// --- verdicts: one calculation behind render, map, and --exit-code ---
+import { verdictCode, verdictText } from "./src/jev.ts";
+assert.equal(verdictText({ type: "noul", noul: 0.99 }), "yes");
+assert.equal(verdictText({ type: "noul", noul: 0.01 }), "no");
+assert.equal(verdictText({ type: "choice", choice: "billing", confidence: 1, probabilities: {} }), "billing");
+assert.equal(verdictText({ type: "score", score: 3, confidence: 1, legend, probabilities: { "3": 1 } }), "furious");
+
+// 0 yes, 2 no, 3 cannot say. 1 stays reserved for a command that failed.
+assert.equal(verdictCode({ type: "noul", noul: 0.99 }), 0);
+assert.equal(verdictCode({ type: "noul", noul: 0.01 }), 2);
+// a noul is measured outward from 0.5, so 0.83 is not settled at the default floor
+assert.equal(verdictCode({ type: "noul", noul: 0.83 }), 3);
+assert.equal(verdictCode({ type: "noul", noul: 0.5 }), 3);
+assert.equal(verdictCode({ type: "choice", choice: "billing", confidence: 0.95, probabilities: {} }), 0);
+assert.equal(verdictCode({ type: "choice", choice: "billing", confidence: 0.4, probabilities: {} }), 3);
+// a confident choice never reports "no": only a noul has one
+assert.notEqual(verdictCode({ type: "choice", choice: "no", confidence: 0.99, probabilities: {} }), 2);
+// a confident "none of these fit" is not something to act on, so it must not exit 0
+assert.equal(verdictCode({ type: "choice", choice: NONE, confidence: 0.99, probabilities: {} }), 3);
+
+// --- the answer marker is part of the grammar, not decoration ---
+assert.match(renderRich({ type: "noul", noul: 0.99 }), /●/);
+assert.doesNotThrow(() => renderRich({ type: "score", score: 1, confidence: 0.9, legend, probabilities: {} }));
+
+// --- a box pads to a fixed width whatever colour codes are inside it ---
+import { box, cyan as paintCyan } from "./src/ui.ts";
+{
+  const bare = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const plain = box(["abc"]).split("\n").map(bare);
+  const painted = box([paintCyan("abc")]).split("\n").map(bare);
+  assert.equal(plain[1].length, painted[1].length, "colour must not change the padding");
+  assert.equal(plain[0].length, plain[1].length, "border and body must line up");
+  assert.equal(plain[1], "\u2502 abc" + " ".repeat(plain[1].length - 6) + "\u2502");
+}
+
+// Last line on purpose: anything added below this would not be covered by it.
 console.log("all checks passed");

